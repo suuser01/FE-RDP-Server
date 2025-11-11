@@ -99,22 +99,12 @@ jobs:
           Write-Host "TCP connectivity successful!"
 
       - name: Maintain Connection
-       shell: pwsh
-       env:
-       TAILSCALE_IP: ${{ env.TAILSCALE_IP }}        # ou ${{ secrets.TAILSCALE_IP }} selon ton set-up
-       SECRET_USERNAME: ${{ secrets.SECRET_USERNAME }}  # configure ce secret dans Settings -> Secrets
-       run: |
-       Write-Host "`n=== RDP ACCESS ==="
-       Write-Host "Address: $env:TAILSCALE_IP"
-       Write-Host "::add-mask::$pwd"
-       $bytes = New-Object byte[] 24
-       [System.Security.Cryptography.RandomNumberGenerator]::Create().GetBytes($bytes)
-       $pwd = [Convert]::ToBase64String($bytes)
-
-       "RDP_PASSWORD=$pwd" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-       Write-Host "Username: (secret)"
-       Write-Host "Password: (generated & stored securely)"
-       Write-Host "==================`n"
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $(echo $env:RDP_CREDS)"
+          Write-Host "==================`n"
           
           # Keep runner active indefinitely (or until manually cancelled)
           while ($true) {
