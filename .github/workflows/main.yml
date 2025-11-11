@@ -1,4 +1,4 @@
-name: Secure RDP
+name: Secure RDP (create -> artifact -> cleanup)
 
 on:
   workflow_dispatch:
@@ -10,8 +10,9 @@ jobs:
 
     steps:
       - name: Configure Core RDP Settings
+        shell: pwsh
         run: |
-          # Activer RDP avec NLA et chiffrement (SecurityLayer = 1 => SSL/TLS)
+          # Activer RDP avec NLA et chiffrement (SecurityLayer = 1 => TLS)
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
              -Name "fDenyTSConnections" -Value 0 -Force
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
@@ -19,11 +20,7 @@ jobs:
           Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
              -Name "SecurityLayer" -Value 1 -Force          # TLS
 
-          # Supprimer règle firewall existante (éviter duplication)
-          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "No existing rule"
-
-          # Ajoute règle firewall mais restreinte ; remoteip laissé vide car Tailscale gère le filtrage.
-          # Si tu connais un CIDR précis à autoriser, remplace remoteip=<CIDR>
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" | Out-Null
           netsh advfirewall firewall add rule name="RDP-Tailscale" dir=in action=allow protocol=TCP localport=3389
 
           Restart-Service -Name TermService -Force
@@ -31,7 +28,7 @@ jobs:
       - name: Create RDP User with Secure Password and save credentials (no logs)
         shell: pwsh
         run: |
-          # Génération d'un mot de passe fort
+          # --- Génération d'un mot de passe fort ---
           $charSet = @{
               Upper   = [char[]](65..90)
               Lower   = [char[]](97..122)
@@ -45,20 +42,20 @@ jobs:
           $rawPassword += $charSet.Special | Get-Random -Count 4
           $password = -join ($rawPassword | Sort-Object { Get-Random })
 
-          # Création utilisateur local (ne pas écrire le mot de passe dans les logs)
-          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+          # --- Création de l'utilisateur local (non-admin par défaut) ---
           if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
             New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -PasswordNeverExpires:$true
             Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP"
-            # Ajoute aux admins seulement si tu sais que c'est nécessaire :
-            # Add-LocalGroupMember -Group "Administrators" -Member "RDP"
           } else {
-            Write-Host "User RDP already exists"
-            # Optionnel : Set-LocalUser -Name "RDP" -Password $securePass
+            # Optionnel : remplacer le mot de passe si l'utilisateur existe déjà
+            $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+            Set-LocalUser -Name "RDP" -Password $securePass
           }
 
-          # Prépare fichier d'identifiants (ne sera pas affiché dans les logs)
-          $credsPath = Join-Path $env:GITHUB_WORKSPACE "rdp_creds_$(Get-Date -Format 'yyyyMMdd_HHmmss').txt"
+          # --- Préparer fichier d'identifiants (ne pas afficher dans les logs) ---
+          $timestamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+          $credsPath = Join-Path $env:GITHUB_WORKSPACE "rdp_creds_$timestamp.txt"
           $content = @()
           $content += "HOSTNAME: gh-runner-$env:GITHUB_RUN_ID"
           $content += "TAILSCALE_IP: will-be-filled-later"
@@ -66,10 +63,11 @@ jobs:
           $content += "PASSWORD: $password"
           $content | Out-File -FilePath $credsPath -Encoding utf8 -Force
 
-          # Expose le chemin pour l'étape suivante (mais pas le contenu)
+          # Expose uniquement le chemin (pas le contenu)
           echo "CREDS_FILE=$credsPath" >> $env:GITHUB_ENV
 
       - name: Install Tailscale
+        shell: pwsh
         run: |
           $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
@@ -81,7 +79,6 @@ jobs:
         shell: pwsh
         run: |
           & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
-          
           $tsIP = $null
           $retries = 0
           while (-not $tsIP -and $retries -lt 12) {
@@ -90,13 +87,12 @@ jobs:
               Start-Sleep -Seconds 5
               $retries++
           }
-
           if (-not $tsIP) {
               Write-Error "Tailscale IP not assigned. Exiting."
               exit 1
           }
 
-          # Met à jour le fichier d'identifiants (taille minime, pas dans les logs)
+          # Mettre à jour le fichier d'identifiants avec l'IP Tailscale
           $credsPath = $env:CREDS_FILE
           (Get-Content $credsPath) -replace 'TAILSCALE_IP: will-be-filled-later', "TAILSCALE_IP: $tsIP" | Set-Content $credsPath
 
@@ -111,7 +107,7 @@ jobs:
               Write-Error "TCP connection to RDP port 3389 failed"
               exit 1
           }
-          Write-Host "TCP connectivity successful (not revealing credentials)."
+          Write-Host "TCP connectivity successful (credentials kept in artifact)."
 
       - name: Upload credentials as artifact (safe: not in logs)
         uses: actions/upload-artifact@v4
@@ -120,17 +116,35 @@ jobs:
           path: ${{ env.CREDS_FILE }}
           retention-days: 1
 
-      - name: Cleanup local creds file
+      - name: Cleanup local creds file (remove plaintext file from runner)
         if: always()
         shell: pwsh
         run: |
-          Remove-Item -Path $env:CREDS_FILE -ErrorAction SilentlyContinue
+          $p = $env:CREDS_FILE
+          if (Test-Path $p) {
+            # Overwrite file content before deletion (optional, defence-in-depth)
+            Set-Content -Path $p -Value ("REMOVED AT $(Get-Date -Format o)") -Force
+            Remove-Item -Path $p -Force -ErrorAction SilentlyContinue
+          }
+
+      - name: Delete local RDP user (cleanup)
+        if: always()
+        shell: pwsh
+        run: |
+          # Supprime l'utilisateur local créé pour l'accès
+          if (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue) {
+              # Optionnel : désactiver d'abord
+              Disable-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+              Start-Sleep -Seconds 1
+              Remove-LocalUser -Name "RDP" -ErrorAction SilentlyContinue
+              Write-Host "User RDP removed"
+          } else {
+              Write-Host "User RDP not found"
+          }
 
       - name: Maintain Connection (keeps runner up)
         if: ${{ always() }}
         shell: pwsh
         run: |
-          Write-Host "Tailscale IP (masked in logs): $env:TAILSCALE_IP"
-          while ($true) {
-              Start-Sleep -Seconds 300
-          }
+          Write-Host "RDP run finished. Artifact 'rdp-credentials' uploaded (retention-days: 1)."
+          while ($true) { Start-Sleep -Seconds 300 }
